@@ -1,10 +1,10 @@
 [package]
 name = "file_backed"
-version = "0.6.13"
+version = "0.6.14"
 edition = "2024"
 license = "MIT"
 documentation = "https://docs.rs/file_backed"
-repository = "https://github.com/dspyz-matician/file_backed"
+repository = "https://github.com/MaticianInc/file_backed"
 description = "Provides types for managing collections of large objects, using an in-memory LRU cache backed by persistent storage (typically the filesystem)."
 
 [dependencies]
