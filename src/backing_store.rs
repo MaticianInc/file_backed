@@ -325,36 +325,24 @@ impl<B: BackingStoreT> BackingStore<B> {
     ///
     /// This exists for bulk-load paths that would otherwise `register` keys one at a
     /// time from a single thread, where per-key backing costs cannot amortize. It must
-    /// not race per-key `register` calls for the same path: the bulk backing copy and
-    /// the token bookkeeping are not atomic with respect to each other.
+    /// not race another registration of the same keys, per-key or bulk: both would copy
+    /// the same key into the backing.
     ///
     /// Must not be called from an async context that isn't allowed to block.
     pub fn blocking_register_all(
         self: &Arc<Self>,
         tracked: &TrackedPath<B::PersistPath>,
     ) -> RegisteredTokens<B> {
+        // A `use_counts` entry means the key's bytes are present, even when its weak is
+        // dead: the pending cleanup deletes them only under the entry lock, and a token
+        // installed under that lock cancels it. Only keys with no entry need the copy.
         let keys = tracked.all_keys();
-        // Only keys with no `use_counts` entry need the backing copy: a live token means
-        // the bytes are already registered, and a dead weak means the bytes are still
-        // present with a cleanup pending — which our new token below will cancel.
-        let to_copy: Vec<Uuid> = keys
-            .iter()
-            .copied()
-            .filter(|key| !self.use_counts.contains_key(key))
-            .collect();
-        self.backing.register_many(tracked.path(), &to_copy);
-        let tokens = keys
-            .into_iter()
-            .map(|key| match self.use_counts.entry(key) {
-                Entry::Vacant(entry) => {
-                    let token = Arc::new(Token {
-                        key,
-                        store: Arc::clone(self),
-                    });
-                    entry.insert(Arc::downgrade(&token));
-                    token
-                }
-                Entry::Occupied(mut entry) => match entry.get().upgrade() {
+        let mut to_copy = Vec::with_capacity(keys.len());
+        let mut tokens = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.use_counts.entry(key) {
+                Entry::Vacant(_) => to_copy.push(key),
+                Entry::Occupied(mut entry) => tokens.push(match entry.get().upgrade() {
                     Some(token) => token,
                     None => {
                         let token = Arc::new(Token {
@@ -364,9 +352,21 @@ impl<B: BackingStoreT> BackingStore<B> {
                         *entry.get_mut() = Arc::downgrade(&token);
                         token
                     }
-                },
-            })
-            .collect();
+                }),
+            }
+        }
+        self.backing.register_many(tracked.path(), &to_copy);
+        for key in to_copy {
+            let Entry::Vacant(entry) = self.use_counts.entry(key) else {
+                panic!("Token already exists for key: {key}");
+            };
+            let token = Arc::new(Token {
+                key,
+                store: Arc::clone(self),
+            });
+            entry.insert(Arc::downgrade(&token));
+            tokens.push(token);
+        }
         RegisteredTokens(tokens)
     }
 
@@ -417,6 +417,12 @@ fn key_map(all_keys: impl IntoIterator<Item = Uuid>) -> DashMap<Uuid, ()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
     use super::*;
 
     struct NoopBacking;
@@ -460,5 +466,77 @@ mod tests {
         drop(store.register(key, &tracked).unwrap());
 
         store.finished().await;
+    }
+
+    /// Counts keys that have bytes and runs a test hook in the middle of `register_many`.
+    struct CountingBacking {
+        copies: AtomicIsize,
+        during_register_many: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl BackingStoreT for CountingBacking {
+        type PersistPath = ();
+        fn delete(&self, _key: Uuid) {
+            self.copies.fetch_sub(1, Ordering::Relaxed);
+        }
+        fn delete_persisted(&self, _path: &(), _key: Uuid) {}
+        fn register(&self, _src_path: &(), _key: Uuid) {
+            self.copies.fetch_add(1, Ordering::Relaxed);
+        }
+        fn register_many(&self, _src_path: &(), keys: &[Uuid]) {
+            self.copies
+                .fetch_add(keys.len() as isize, Ordering::Relaxed);
+            if let Some(hook) = self.during_register_many.lock().take() {
+                hook();
+            }
+        }
+        fn persist(&self, _dest_path: &(), _key: Uuid) {}
+        fn sanitize_path(&self, _path: &()) -> impl IntoIterator<Item = Uuid> {
+            []
+        }
+        fn sync_persisted(&self, _path: &()) {}
+    }
+
+    /// A dropped token's cleanup that runs during `blocking_register_all` must not leave
+    /// the returned token without bytes, and those bytes are deleted once it drops.
+    #[test]
+    fn register_all_with_pending_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let store = Arc::new(BackingStore::new(
+            CountingBacking {
+                copies: AtomicIsize::new(0),
+                during_register_many: Mutex::new(Some(Box::new(move || {
+                    gate_tx.send(()).unwrap();
+                    done_rx.recv().unwrap();
+                }))),
+            },
+            runtime.handle().clone(),
+        ));
+        let key = Uuid::new_v4();
+        let tracked = TrackedPath {
+            path: (),
+            present: DashMap::from_iter([(key, ())]),
+        };
+
+        // The one blocking thread runs, in order: gate, the dropped token's cleanup, done.
+        store.spawn_blocking(move || gate_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        drop(store.register(key, &tracked).unwrap());
+        store.spawn_blocking(move || done_tx.send(()).unwrap());
+
+        let copies = || store.backing.copies.load(Ordering::Relaxed);
+        let tokens = store.blocking_register_all(&tracked);
+        assert!(store.backing.during_register_many.lock().is_none());
+        assert_eq!(copies(), 1);
+
+        drop(tokens);
+        runtime.block_on(store.finished());
+        assert_eq!(copies(), 0);
+        let _tokens = store.blocking_register_all(&tracked);
+        assert_eq!(copies(), 1);
     }
 }
