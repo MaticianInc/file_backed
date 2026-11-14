@@ -2,7 +2,7 @@ use std::sync::{Arc, Weak};
 
 use dashmap::{DashMap, Entry};
 use tokio::task::JoinHandle;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 use uuid::Uuid;
 
 /// Defines the low-level interface for physically storing, retrieving,
@@ -120,6 +120,17 @@ impl<T, B: Strategy<T>> Strategy<T> for Arc<B> {
 pub struct BackingStore<B: BackingStoreT> {
     backing: B,
     use_counts: DashMap<Uuid, Weak<Token<B>>>,
+    /// Orders bulk registration against the per-key paths that add or remove keys in the
+    /// backing store. [`Self::register`] takes it shared and token cleanup tries it shared;
+    /// [`Self::blocking_register_all`] takes it exclusive, because it decides which keys
+    /// to copy before it creates their tokens. Without it, a cleanup that runs in between
+    /// deletes a key the bulk call decided not to copy, and the bulk call then hands out a
+    /// token whose bytes are gone.
+    registration: parking_lot::RwLock<()>,
+    /// Token cleanups that found a bulk registration in progress. They are queued here
+    /// instead of parking a blocking thread on [`Self::registration`] for the whole bulk
+    /// copy; [`Self::blocking_register_all`] respawns them when it finishes.
+    deferred_cleanups: parking_lot::Mutex<Vec<Uuid>>,
     runtime: tokio::runtime::Handle,
     task_tracker: TaskTracker,
 }
@@ -172,20 +183,32 @@ impl<P> TrackedPath<P> {
 
 impl<B: BackingStoreT> Drop for Token<B> {
     fn drop(&mut self) {
-        let name = self.key;
-        let store = Arc::clone(&self.store);
-        self.store.spawn_blocking(move || {
-            let Entry::Occupied(entry) = store.use_counts.entry(name) else {
-                // Another token's cleanup task already removed this entry.
-                // This happens when register() reuses a key with a pending cleanup.
-                return;
-            };
-            if entry.get().strong_count() > 0 {
-                return;
-            }
-            store.backing.delete(name);
-            entry.remove();
-        });
+        self.store.spawn_cleanup(self.key);
+    }
+}
+
+/// Holds [`BackingStore::registration`] exclusively for a bulk registration. On drop,
+/// including on unwind, it releases the lock and respawns the cleanups queued meanwhile.
+struct BulkRegistration<'a, B: BackingStoreT> {
+    store: &'a Arc<BackingStore<B>>,
+    exclusive: Option<parking_lot::RwLockWriteGuard<'a, ()>>,
+    /// Keeps the store's task tracker non-empty until the queued cleanups are respawned,
+    /// so [`BackingStore::finished`] waits for them even when the bulk call runs on a
+    /// thread the tracker does not know about. Fields drop after `Drop::drop`.
+    _tracked: TaskTrackerToken,
+}
+
+impl<B: BackingStoreT> Drop for BulkRegistration<'_, B> {
+    fn drop(&mut self) {
+        // Take the queue before releasing the lock: a cleanup that fails its try-lock
+        // pushes while holding the queue lock, so none is missed.
+        let mut queue = self.store.deferred_cleanups.lock();
+        let deferred = std::mem::take(&mut *queue);
+        drop(self.exclusive.take());
+        drop(queue);
+        for key in deferred {
+            self.store.spawn_cleanup(key);
+        }
     }
 }
 
@@ -208,6 +231,8 @@ impl<B: BackingStoreT> BackingStore<B> {
         Self {
             backing,
             use_counts: DashMap::new(),
+            registration: parking_lot::RwLock::new(()),
+            deferred_cleanups: parking_lot::Mutex::new(Vec::new()),
             runtime,
             task_tracker: TaskTracker::new(),
         }
@@ -244,6 +269,36 @@ impl<B: BackingStoreT> BackingStore<B> {
         f: impl FnOnce() -> R + Send + 'static,
     ) -> JoinHandle<R> {
         self.task_tracker.spawn_blocking_on(f, &self.runtime)
+    }
+
+    /// Returns the wrapped backend, for tests that inspect it.
+    #[cfg(all(test, feature = "redb-bincodec"))]
+    pub(crate) fn backing_for_test(&self) -> &B {
+        &self.backing
+    }
+
+    /// Returns how many token cleanups wait for a bulk registration to finish.
+    #[cfg(all(test, feature = "redb-bincodec"))]
+    pub(crate) fn deferred_cleanups_for_test(&self) -> usize {
+        self.deferred_cleanups.lock().len()
+    }
+
+    /// Deletes `key` from the backend in a blocking task if no token holds it any more.
+    /// While a bulk registration runs, the task queues the key and returns instead of
+    /// waiting for the lock; the bulk call respawns it when it finishes.
+    fn spawn_cleanup(self: &Arc<Self>, key: Uuid) {
+        let store = Arc::clone(self);
+        self.spawn_blocking(move || {
+            // Holding the queue lock while trying the registration lock means a bulk call
+            // cannot drain the queue between a failed try and the push below.
+            let mut deferred = store.deferred_cleanups.lock();
+            let Some(_shared) = store.registration.try_read() else {
+                deferred.push(key);
+                return;
+            };
+            drop(deferred);
+            store.cleanup_unshared(key);
+        });
     }
 
     /// Returns a reference to the Tokio runtime handle used by this store.
@@ -301,6 +356,7 @@ impl<B: BackingStoreT> BackingStore<B> {
         key: Uuid,
         tracked: &TrackedPath<B::PersistPath>,
     ) -> Option<Arc<Token<B>>> {
+        let _shared = self.registration.read();
         let _exists_guard = tracked.present.get(&key)?;
         let mut entry = match self.use_counts.entry(key) {
             Entry::Vacant(entry) => {
@@ -324,19 +380,30 @@ impl<B: BackingStoreT> BackingStore<B> {
     /// reusing the live token) survive.
     ///
     /// This exists for bulk-load paths that would otherwise `register` keys one at a
-    /// time from a single thread, where per-key backing costs cannot amortize. It must
-    /// not race per-key `register` calls for the same path: the bulk backing copy and
-    /// the token bookkeeping are not atomic with respect to each other.
+    /// time from a single thread, where per-key backing costs cannot amortize.
+    ///
+    /// It holds the store's registration lock exclusively for the whole call, so per-key
+    /// `register` calls on other threads wait until it returns. Token cleanups do not
+    /// wait: they queue their key and this call respawns them when it is done.
+    /// That keeps the copy decision and the token creation atomic: a key that had a
+    /// token when the copy list was built cannot be deleted before its new token exists.
     ///
     /// Must not be called from an async context that isn't allowed to block.
     pub fn blocking_register_all(
         self: &Arc<Self>,
         tracked: &TrackedPath<B::PersistPath>,
     ) -> RegisteredTokens<B> {
+        let _bulk = BulkRegistration {
+            store: self,
+            exclusive: Some(self.registration.write()),
+            _tracked: self.task_tracker.token(),
+        };
         let keys = tracked.all_keys();
         // Only keys with no `use_counts` entry need the backing copy: a live token means
         // the bytes are already registered, and a dead weak means the bytes are still
-        // present with a cleanup pending — which our new token below will cancel.
+        // present with a cleanup pending — which our new token below will cancel. Both
+        // stay true until the tokens below exist: while the exclusive lock is held, a
+        // cleanup fails its try-lock and queues its key instead of deleting it.
         let to_copy: Vec<Uuid> = keys
             .iter()
             .copied()
@@ -368,6 +435,21 @@ impl<B: BackingStoreT> BackingStore<B> {
             })
             .collect();
         RegisteredTokens(tokens)
+    }
+
+    /// Deletes `key` from the backend if no token holds it any more. The caller holds
+    /// [`Self::registration`] shared.
+    fn cleanup_unshared(&self, key: Uuid) {
+        let Entry::Occupied(entry) = self.use_counts.entry(key) else {
+            // Another token's cleanup task already removed this entry.
+            // This happens when register() reuses a key with a pending cleanup.
+            return;
+        };
+        if entry.get().strong_count() > 0 {
+            return;
+        }
+        self.backing.delete(key);
+        entry.remove();
     }
 
     /// Asynchronously triggers the underlying `BackingStoreT::sync_persisted`
@@ -402,6 +484,9 @@ impl<B: BackingStoreT> BackingStore<B> {
     /// and waits for completion.
     /// Must not be called from an async context that isn't allowed to block.
     pub fn blocking_delete_persisted(&self, tracked: &TrackedPath<B::PersistPath>, key: Uuid) {
+        // Shared with per-key registration: a bulk registration must not lose a source key
+        // between listing it and copying it.
+        let _shared = self.registration.read();
         let entry = match tracked.present.entry(key) {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(_) => return,

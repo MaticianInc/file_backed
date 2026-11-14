@@ -975,3 +975,286 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "redb-bincodec"))]
+mod register_all_race_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+    use redb::ReadableDatabase;
+    use tempfile::tempdir;
+    use tokio::runtime::Handle;
+    use uuid::Uuid;
+
+    use super::{BLOBS, BinCodec, BlobCodec, RedbPath, RedbStore, insert_bytes};
+    use crate::backing_store::{BackingStoreT, Strategy};
+    use crate::{BackingStore, FBPool, Fb};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// A [`RedbStore`] that runs a hook inside `register_many`, i.e. after
+    /// `blocking_register_all` has chosen which keys to copy and before it creates
+    /// their tokens.
+    struct HookedStore {
+        inner: RedbStore<BinCodec>,
+        hook: Mutex<Option<Hook>>,
+        /// Temporary-store deletes that returned (a delete of a missing key panics).
+        deletes: AtomicUsize,
+    }
+
+    impl BackingStoreT for HookedStore {
+        type PersistPath = RedbPath;
+
+        fn delete(&self, key: Uuid) {
+            self.inner.delete(key);
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+        }
+        fn delete_persisted(&self, path: &RedbPath, key: Uuid) {
+            self.inner.delete_persisted(path, key)
+        }
+        fn register(&self, src_path: &RedbPath, key: Uuid) {
+            self.inner.register(src_path, key)
+        }
+        fn register_many(&self, src_path: &RedbPath, keys: &[Uuid]) {
+            if let Some(hook) = self.hook.lock().take() {
+                hook();
+            }
+            self.inner.register_many(src_path, keys)
+        }
+        fn persist(&self, dest_path: &RedbPath, key: Uuid) {
+            self.inner.persist(dest_path, key)
+        }
+        fn sanitize_path(&self, path: &RedbPath) -> impl IntoIterator<Item = Uuid> {
+            self.inner.sanitize_path(path)
+        }
+        fn sync_persisted(&self, path: &RedbPath) {
+            self.inner.sync_persisted(path)
+        }
+    }
+
+    impl Strategy<Vec<u8>> for HookedStore {
+        fn store(&self, key: Uuid, data: &Vec<u8>) {
+            self.inner.store(key, data)
+        }
+        fn load(&self, key: Uuid) -> Vec<u8> {
+            self.inner.load(key)
+        }
+    }
+
+    fn contains(path: &RedbPath, key: Uuid) -> bool {
+        let read_txn = path.db().begin_read().unwrap();
+        let table = read_txn.open_table(BLOBS).unwrap();
+        table.get(key.as_bytes()).unwrap().is_some()
+    }
+
+    /// Mosaic's map load (`MissionMaps::from_protos`) bulk-registers a save while the
+    /// previous map, holding tokens for the same tile keys, is still being dropped. If a
+    /// token's cleanup runs between the bulk call's copy decision and its token creation,
+    /// the bulk call used to hand out a token with no bytes behind it: the next load
+    /// panicked with "Attempted to read missing redb key … from temporary store", and the
+    /// token's own cleanup with "Attempted to delete missing redb key …".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bulk_register_survives_concurrent_token_cleanup() {
+        let cache_dir = tempdir().unwrap();
+        let persist_dir = tempdir().unwrap();
+        let cache = RedbPath::in_dir(cache_dir.path());
+        let persisted = RedbPath::in_dir(persist_dir.path());
+        let key = Uuid::from_u128(7);
+        let data = vec![42u8; 64];
+        insert_bytes(
+            &persisted,
+            key,
+            &BlobCodec::<Vec<u8>>::encode(&BinCodec, &data).unwrap(),
+            "persisted",
+        );
+
+        let store = Arc::new(BackingStore::new(
+            HookedStore {
+                inner: RedbStore::new(BinCodec, cache.clone()),
+                hook: Mutex::new(None),
+                deletes: AtomicUsize::new(0),
+            },
+            Handle::current(),
+        ));
+        let pool: Arc<FBPool<Vec<u8>, HookedStore>> = Arc::new(FBPool::new(Arc::clone(&store), 4));
+        let cache_check = cache.clone();
+        let queued = Arc::new(AtomicBool::new(false));
+        let queued_check = Arc::clone(&queued);
+
+        let task_store = Arc::clone(&store);
+        let loaded = tokio::task::spawn_blocking(move || {
+            let tracked = task_store.blocking_track_path(persisted);
+            // The "previous map": a live registration of the key.
+            let old: Fb<Vec<u8>, HookedStore> = pool.blocking_register(&tracked, key).unwrap();
+            assert!(contains(&cache, key));
+
+            // Between the copy decision and token creation, the old map goes away and
+            // its cleanup gets a chance to delete the key. Without the fix the cleanup
+            // runs at once and deletes it. With the fix it queues the key for the bulk
+            // call and returns, without parking a blocking thread on the lock.
+            let old = Mutex::new(Some(old));
+            let hook_cache = cache.clone();
+            let hook_store = Arc::clone(&task_store);
+            let hook_queued = Arc::clone(&queued);
+            *task_store.backing_for_test().hook.lock() = Some(Box::new(move || {
+                drop(old.lock().take());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while contains(&hook_cache, key)
+                    && hook_store.deferred_cleanups_for_test() == 0
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // The cleanup queued the key and returned, leaving the bytes in place.
+                hook_queued.store(
+                    hook_store.deferred_cleanups_for_test() == 1 && contains(&hook_cache, key),
+                    Ordering::SeqCst,
+                );
+            }));
+
+            let registered = task_store.blocking_register_all(&tracked);
+            assert_eq!(registered.len(), 1);
+            // The queued cleanup was respawned when the bulk call returned.
+            assert_eq!(task_store.deferred_cleanups_for_test(), 0);
+            // The "new map" registers the key and reuses the bulk token.
+            let new = pool.blocking_register(&tracked, key).unwrap();
+            let loaded = new.blocking_load().clone();
+            drop(new);
+            drop(registered);
+            loaded
+        })
+        .await
+        .unwrap();
+        assert_eq!(loaded, data);
+        assert!(
+            queued_check.load(Ordering::SeqCst),
+            "the old map's cleanup should queue during the bulk call, not block or delete"
+        );
+        store.finished().await;
+        // The old map's cleanup found the bulk token alive and kept the key; the last
+        // token's cleanup then deleted it exactly once, without a missing-key panic.
+        assert_eq!(store.backing_for_test().deletes.load(Ordering::SeqCst), 1);
+        assert!(!contains(&cache_check, key));
+    }
+    type Setup = (
+        Arc<BackingStore<HookedStore>>,
+        Arc<FBPool<Vec<u8>, HookedStore>>,
+        RedbPath,
+        RedbPath,
+        Uuid,
+    );
+
+    /// A store whose persisted path holds one key, plus a pool to register it.
+    fn setup(cache_dir: &std::path::Path, persist_dir: &std::path::Path) -> Setup {
+        let cache = RedbPath::in_dir(cache_dir);
+        let persisted = RedbPath::in_dir(persist_dir);
+        let key = Uuid::from_u128(9);
+        insert_bytes(
+            &persisted,
+            key,
+            &BlobCodec::<Vec<u8>>::encode(&BinCodec, &vec![1u8; 16]).unwrap(),
+            "persisted",
+        );
+        let store = Arc::new(BackingStore::new(
+            HookedStore {
+                inner: RedbStore::new(BinCodec, cache.clone()),
+                hook: Mutex::new(None),
+                deletes: AtomicUsize::new(0),
+            },
+            Handle::current(),
+        ));
+        let pool = Arc::new(FBPool::new(Arc::clone(&store), 4));
+        (store, pool, cache, persisted, key)
+    }
+
+    /// Waits until the old map's cleanup has queued its key for the bulk call.
+    fn wait_queued(store: &BackingStore<HookedStore>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.deferred_cleanups_for_test() == 0 {
+            assert!(Instant::now() < deadline, "cleanup never queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// `finished()` must not return while a cleanup sits in the bulk call's queue, even
+    /// when the bulk call runs on a thread the store's task tracker does not track.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finished_waits_for_cleanups_queued_by_bulk_register() {
+        let cache_dir = tempdir().unwrap();
+        let persist_dir = tempdir().unwrap();
+        let (store, pool, _cache, persisted, key) = setup(cache_dir.path(), persist_dir.path());
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let task_store = Arc::clone(&store);
+        let bulk = std::thread::spawn(move || {
+            let tracked = task_store.blocking_track_path(persisted);
+            let old: Fb<Vec<u8>, HookedStore> = pool.blocking_register(&tracked, key).unwrap();
+            let old = Mutex::new(Some(old));
+            let hook_store = Arc::clone(&task_store);
+            *task_store.backing_for_test().hook.lock() = Some(Box::new(move || {
+                drop(old.lock().take());
+                wait_queued(&hook_store);
+                queued_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }));
+            drop(task_store.blocking_register_all(&tracked));
+        });
+
+        tokio::task::spawn_blocking(move || queued_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let finished_store = Arc::clone(&store);
+        let mut finished = tokio::spawn(async move { finished_store.finished().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut finished)
+                .await
+                .is_err(),
+            "finished() returned while a cleanup was still queued"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), finished)
+            .await
+            .expect("finished() should return once the bulk call is done")
+            .unwrap();
+        bulk.join().unwrap();
+        assert_eq!(store.deferred_cleanups_for_test(), 0);
+    }
+
+    /// If the bulk copy panics, the cleanups it queued still run: the key the old map
+    /// released is deleted once, and nothing is left in the queue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bulk_register_panic_still_runs_queued_cleanups() {
+        let cache_dir = tempdir().unwrap();
+        let persist_dir = tempdir().unwrap();
+        let (store, pool, cache, persisted, key) = setup(cache_dir.path(), persist_dir.path());
+
+        let task_store = Arc::clone(&store);
+        let result = tokio::task::spawn_blocking(move || {
+            let tracked = task_store.blocking_track_path(persisted);
+            let old: Fb<Vec<u8>, HookedStore> = pool.blocking_register(&tracked, key).unwrap();
+            let old = Mutex::new(Some(old));
+            let hook_store = Arc::clone(&task_store);
+            *task_store.backing_for_test().hook.lock() = Some(Box::new(move || {
+                drop(old.lock().take());
+                wait_queued(&hook_store);
+                panic!("injected register_many failure");
+            }));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(task_store.blocking_register_all(&tracked));
+            }))
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "the injected panic should reach the caller"
+        );
+        store.finished().await;
+        assert_eq!(store.deferred_cleanups_for_test(), 0);
+        assert_eq!(store.backing_for_test().deletes.load(Ordering::SeqCst), 1);
+        assert!(!contains(&cache, key));
+    }
+}
